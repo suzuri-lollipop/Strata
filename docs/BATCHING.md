@@ -22,6 +22,21 @@ asked, with a note when it is more than setup would recommend.
 "parallel": 2
 ```
 
+How the slots decode is tunable the same way, each key optional and each skipped (said once) when the config's `args`
+already carry the option:
+
+```
+"batch_groups": 1,     the engine's --batch-groups: 1 = one serial window over every slot (the adaptive tier runs
+                       between its windows), "auto" or N = the slots in N groups pipelined through a layer split
+"batch_mtp": true,     --batch-mtp: each slot verifies one MTP proposal per window (below)
+"adapt_async": true,   --adapt-async 1: the adaptive tier's rounds do not block the windows (below)
+"adapt_every": 4       --adapt-every N: an adaptive-tier round every N windows
+```
+
+Where the experts do not mostly fit in VRAM, the serial window with the asynchronous tier (`"batch_groups": 1,
+"adapt_async": true`) measured fastest of the combinations below; where they do fit, the pipelined groups keep their
+advantage (the tables further down).
+
 With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the server's
 environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch behaviour
 described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so check the
@@ -365,7 +380,8 @@ Swaps move experts between the GPU and the CPU, which round differently, so gree
 `--adapt-every 1000000` keeps the tier fixed (as in the exactness settings below). The pipelined `--batch-groups` path
 does not adapt.
 
-With `--adapt-async 1` (needs the resident RAM mode) the round does not hold a window up: each batch window moves the
+With `--adapt-async 1` (needs the resident RAM mode or the expert arena; the arena with and without a layer split -
+every stage's cache refills on its own stream and event) the round does not hold a window up: each batch window moves the
 round on one step (table changes and uploads on the main thread, the copies on a helper thread and the cards' refill
 streams), as on the solo path. A request that arrives finishes the round in flight before it starts, and a prompt read
 between decoding windows does not move it. `--adapt-min-gain F` (default 1.5) raises the bar a swap must clear (the
@@ -389,6 +405,38 @@ compares the tier as a whole, not "batch windows only": the solo decode speed mo
 43.1 tok/s). The prompts are the benchmark's own, eight topics that repeat, which the tier learns quickly, so on a
 more varied workload the gain may be smaller (not measured). Upstream main runs no tier in batch windows, and this
 was not measured against an upstream binary.
+
+In the arena mode, where the CPU serves a large share of the windows' experts, the blocking round's wait is the larger
+part of the window and the asynchronous round removes it. Measured with one engine binary, `--adapt-async 1` off and
+on (Qwen3.8-Flash-Next NVFP4, its 63 GiB expert arena in RAM, one RTX PRO 4000 Blackwell 24 GB with ~5.4K expert
+slots cached, i9-13900K, `--kv-resident 32768` of a 64K context, `"parallel": 4`, ~26% of the batch windows' routed
+entries on the CPU; `tools/serve_load.py`, three rounds of 256-token greedy answers per client count, medians; a
+calibration job used ~7 of the 32 threads beside both arms):
+
+| | blocking tier | `--adapt-async 1` |
+| --- | ---: | ---: |
+| one request alone (the solo path) | 29.9 tok/s | **39.8 tok/s** |
+| 2 clients, total | 33.2 tok/s | **43.5 tok/s** |
+| 4 clients, total | 42.0 tok/s | **53.0 tok/s** |
+| the 4-row batch window | 69.8 ms, adapt wait 10.1 ms | 51.3 ms, adapt wait 0.1 ms |
+
+The same machine also loses with `--batch-mtp` in this regime (the proposal rows double the CPU experts' share of the
+window: 4 clients 49.3 -> 43.5 tok/s total, proposals accepted 64.6%), as on the R9700 split above - it pays where
+the experts run from VRAM.
+
+The same switch on a two-GPU layer split (2x RTX PRO 4000 Blackwell 24 GB, the same NVFP4 model and its 63 GiB arena,
+`"layer_split": "auto"`, `"parallel": 4`, `--kv-resident 32768` of a 128K context, one engine binary with the flag off
+and on, `tools/serve_load.py`, three rounds of 256-token greedy answers per client count, medians):
+
+| clients | serial windows, blocking tier | serial windows, `--adapt-async 1` |
+| --- | ---: | ---: |
+| 1 (the solo path) | 64.2 tok/s | **66.5 tok/s** |
+| 2 | 72.8 | **74.9** |
+| 4 | 89.3 | **95.9** |
+
+The batch windows' adapt wait falls from 2.1 to 0.1 ms and the solo path's rounds stop holding its windows too
+(+3.6% alone). Exactness on the split: `tools/batch_test.py --batch 4 --extra "--batch-groups 1 --adapt-async 1
+--pcie-frac 0 --adapt-every 1000000"` gave every slot's 150 greedy tokens equal to its solo tokens.
 
 ## Exactness
 
