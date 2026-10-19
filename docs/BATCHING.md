@@ -194,7 +194,14 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
 - **A long prompt gives way to a short one** (#656's cooperative preemption): when a request with a prompt under
   half as long is waiting, the server sends `BYIELD`; at its next chunk boundary the long read stops, the part read
   so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the
-  same chunks (at most twice per request).
+  same chunks (at most twice per request). A read with nothing decoding only takes pieces - and so only finds
+  boundaries to give way at - every `STRATA_BATCH_YIELD_CHUNKS` chunks (default 8: a read below 8 chunks, 64K tokens
+  at the default chunk, never gives way to anything). With `STRATA_BATCH_YIELD_CHUNKS=1` on the production split
+  below (2x RTX PRO 4000 Blackwell, the NVFP4 arena, `"parallel": 4`, serial windows, `tools/piped_read_join_bench.py`'s
+  `followup`: a cold 44K read, a 42-token question 1 s behind it) the question's first token came at 6.5 s instead of
+  30.0 s (the whole read), and the read itself took 39.7 s instead of 29.8 s - most of that is what the give-way
+  itself costs the read (its part read waits in a slot and is copied back), not the pieces: `=2` (two boundaries
+  fewer) measured the same 36.0-39.7 s for the read and 10.4-12.4 s for the question.
 - **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the
   checkpoint at the prompt's last turn boundary); the next turn of that conversation goes to that slot and the
   engine copies its state back (50-60 ms for a short conversation) instead of reading the history again - also for
