@@ -7579,7 +7579,14 @@ int main(int argc, char** argv) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
                         : !o.resident_cpu_experts && srcp != &arena_src ? "it needs the resident RAM mode, --resident-experts, or the expert arena"
-                        : multi_gpu && srcp == &arena_src ? "not with a layer split in the arena mode"
+                        // (the arena's layer split was gated off until 0.1.44.1 as unmeasured; the round is per-home
+                        // (ahomes[k] = stage k-1's cache, its own stream and event), the arena is host-registered
+                        // PORTABLE, and the serial loops tick between windows with every stage synchronised - the
+                        // same shape the resident RAM mode runs on a split.  Measured, arena mode, the same binary
+                        // with the flag off and on: one RTX PRO 4000 Blackwell - the batch windows' adapt wait
+                        // 9.1 -> 1.0 ms, 43.6 -> 49.8 rows/s at two slots; a two-GPU layer split - the serial batch
+                        // windows' adapt wait 2.1 -> 0.1 ms, four clients 89.3 -> 95.9 tok/s aggregate, and the solo
+                        // path 61.3 -> 66.5 tok/s (tools/serve_load.py, three rounds, medians).)
                         : o.pipeline_windows >= 2 && srcp == &arena_src ? "not with --pipeline-windows 2 in the arena mode"
                         : o.batch > 0 && o.batch_groups > 1 ? "not with --batch-groups (the pipelined slot groups)"
                         : peer.valid() ? "not with --peer-device"
