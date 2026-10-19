@@ -2670,6 +2670,7 @@ def engine_args(cfg: dict) -> list[str]:
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
+    args += batch_tune_args(cfg, args)
     return learned_profile_args(cfg, args)
 
 
@@ -2695,6 +2696,51 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
         print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
     return ["--batch", str(n)]
+
+
+# (opt-in) config keys that pick HOW the engine runs, mapped to their engine options.  The config's "args" always win:
+# a key whose option is already in the args is said once and skipped.  Nothing here is required; without the keys the
+# engine's own defaults run, byte-identical to the last release.
+#   "batch_groups": N or "auto"  --batch-groups: with a layer split, the N slots in N groups pipelined through the
+#                                 GPUs (the engine's default on a split), or 1 = every slot in one serial window.
+#                                 Serial windows run the adaptive expert tier and (with --batch-mtp) the slots' MTP
+#                                 drafts; the pipelined path runs neither (docs/BATCHING.md).
+#   "batch_mtp": true            --batch-mtp: each slot verifies one MTP proposal per window.  Pays where the experts
+#                                 mostly fit in VRAM; where the CPU serves a large share of a window's experts the
+#                                 extra rows cost more than the accepted proposals give back.
+#   "adapt_async": true          --adapt-async 1: the adaptive tier's rounds do not block the windows (copies on a
+#                                 helper thread).  Needs the resident RAM mode or the expert arena.
+#   "adapt_every": N             --adapt-every N: an adaptive-tier round every N windows (the engine's default: 4).
+BATCH_TUNE_ARGS = {"batch_groups": "--batch-groups", "batch_mtp": "--batch-mtp",
+                   "adapt_async": "--adapt-async", "adapt_every": "--adapt-every"}
+
+
+def batch_tune_args(cfg: dict, args: list[str]) -> list[str]:
+    """The engine options of the config's batch-tuning keys (BATCH_TUNE_ARGS), for the keys the config sets and the
+    args do not already carry.  A key with a value of the wrong shape is said and ignored, as in parallel_args."""
+    out: list[str] = []
+    for key, opt in BATCH_TUNE_ARGS.items():
+        v = cfg.get(key)
+        if v is None or v is False or opt in args:
+            continue
+        if key == "batch_groups":
+            if v == "auto" or (isinstance(v, int) and not isinstance(v, bool) and v >= 1):
+                out += [opt, str(v)]
+            else:
+                print(f'[strata] "{key}" must be "auto" or a whole number of groups >= 1, not {v!r}: ignored',
+                      flush=True)
+        elif key == "adapt_every":
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                out += [opt, str(v)]
+            else:
+                print(f'[strata] "{key}" must be a whole number of windows >= 0, not {v!r}: ignored', flush=True)
+        elif v is True:
+            out.append(opt)
+            if key == "adapt_async":
+                out.append("1")
+        else:
+            print(f'[strata] "{key}" must be true or false, not {v!r}: ignored', flush=True)
+    return out
 
 
 def profile_shape(path: str) -> tuple[int, int] | None:

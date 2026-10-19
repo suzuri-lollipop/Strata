@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
+from serve.server import ByteTokenizer, Service, StrataEngine, batch_tune_args, engine_args, parallel_args, serve
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -220,6 +220,34 @@ class ParallelArgs(unittest.TestCase):
 
         args = engine_args({"args": ["--pack", "p"], "parallel": 2})
         self.assertEqual(args[-2:], ["--batch", "2"])
+
+    def test_batch_tune_config_keys(self):
+        # each key maps to its engine option
+        self.assertEqual(batch_tune_args({"batch_groups": 1}, []), ["--batch-groups", "1"])
+        self.assertEqual(batch_tune_args({"batch_groups": "auto"}, []), ["--batch-groups", "auto"])
+        self.assertEqual(batch_tune_args({"batch_mtp": True}, []), ["--batch-mtp"])
+        self.assertEqual(batch_tune_args({"adapt_async": True}, []), ["--adapt-async", "1"])
+        self.assertEqual(batch_tune_args({"adapt_every": 8}, []), ["--adapt-every", "8"])
+        # off / absent keys add nothing; false is off
+        self.assertEqual(batch_tune_args({}, []), [])
+        self.assertEqual(batch_tune_args({"batch_mtp": False, "adapt_async": False}, []), [])
+        self.assertEqual(batch_tune_args({"batch_groups": None}, []), [])
+        # the args' own option wins: the key is skipped, not doubled
+        self.assertEqual(batch_tune_args({"batch_groups": 1}, ["--batch-groups", "2"]), [])
+        self.assertEqual(batch_tune_args({"batch_mtp": True}, ["--batch-mtp"]), [])
+        self.assertEqual(batch_tune_args({"adapt_async": True}, ["--adapt-async"]), [])
+        # bad shapes are ignored (and said, not raised)
+        import contextlib, io
+        for cfg in ({"batch_groups": 0}, {"batch_groups": "2"}, {"batch_groups": True},
+                    {"adapt_every": -1}, {"adapt_every": "4"}, {"batch_mtp": "yes"}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(batch_tune_args(cfg, []), [], cfg)
+        # several keys keep the option order of BATCH_TUNE_ARGS
+        self.assertEqual(batch_tune_args({"adapt_async": True, "batch_groups": 1}, []),
+                         ["--batch-groups", "1", "--adapt-async", "1"])
+        # and they reach the engine's command through engine_args
+        args = engine_args({"args": ["--pack", "p"], "parallel": 2, "batch_groups": 1, "adapt_async": True})
+        self.assertEqual(args, ["--pack", "p", "--batch", "2", "--batch-groups", "1", "--adapt-async", "1"])
 
 
 class PickSlot(unittest.TestCase):
