@@ -137,7 +137,7 @@ how the work is scheduled or copied, not what is computed; the identity gates an
 | `STRATA_BATCH_SELF_COMMIT=1` | a one-row-per-slot window advances the GDN state itself, no commit graph |
 | `STRATA_QSA_SLOTS=1` | a window's QSA block scores, top-k and attention run as one launch over its rows |
 | `STRATA_HANDOFF_PIPE=P` | a layer split hands a prompt chunk to the next card in P pieces (2..16), gated by events, on a persistent thread |
-| `STRATA_ADMIT_SHORT_FIRST=N` (server) | a new prompt of at most N tokens takes the control lines before longer ones (a longer one that waited `STRATA_ADMIT_MAX_WAIT_S`, default 30, counts as short) |
+| `STRATA_ADMIT_SHORT_FIRST=N` (server) | a new prompt that reads at most N tokens (its length less what a cache serves, as for the give-way below) takes the control lines before longer ones (a longer one that waited `STRATA_ADMIT_MAX_WAIT_S`, default 30, counts as short) |
 | `STRATA_TRACE=1` | one line per admission with its phases (drain, prompt, first window, slot copy, checkpoint copy) |
 | `STRATA_MMQ_DIRECT=1`, `STRATA_MMQ_GROUP_SORT=1` | CUDA, needs the build option `-DSTRATA_MMQ_TAB=ON`: the prompt MMQ reads resident experts in their cache slots; full MMQ groups sorted by row count (docs/DETAILS.md) |
 
@@ -191,10 +191,19 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   2048-8192 tokens) they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so
   a long prompt slows the others down instead of stopping them. The chunks are the ones one uninterrupted read
   takes, so the prompt's arithmetic is unchanged.
-- **A long prompt gives way to a short one** (#656's cooperative preemption): when a request with a prompt under
-  half as long is waiting, the server sends `BYIELD`; at its next chunk boundary the long read stops, the part read
-  so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the
-  same chunks (at most twice per request). A read with nothing decoding only takes pieces - and so only finds
+- **A long prompt gives way to a short one** (#656's cooperative preemption): when a waiting request's admission
+  reads under half as many tokens, the server sends `BYIELD`; at its next chunk boundary the long read stops, the
+  part read so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot
+  with the same chunks (at most twice per request). What a waiter reads is its prompt less what a cache serves: a
+  conversation's next turn counts by its few new tokens however long its history renders (a free slot holds the
+  history - its admission is a copy), a request the server STOPped mid-answer counts as the shortest there is (the
+  engine's prompt cache holds its stream), and a read resumed after a give-way counts the part it gave up at as
+  read. `STRATA_ADMIT_SHORT_FIRST` orders new admissions by the same count. On the production split below (2x RTX
+  PRO 4000 Blackwell, the NVFP4 arena, `"parallel": 8`, pipelined groups, `STRATA_PIPED_CONCURRENT=1`) a 31.6K-token
+  follow-up turn whose slot held 31,610 of its tokens, 1 s behind a cold 44K read: its first token came at 6.3 s
+  instead of 30.1 s (the whole read), and the read itself took 33.6 s instead of 30.2 s (the give-way's cost). A
+  follow-up whose history no slot holds (its first turn ran solo and the engine's own cache went with the next
+  read) reads all of its prompt and waits as before - a give-way there would only reorder two cold reads. A read with nothing decoding only takes pieces - and so only finds
   boundaries to give way at - every `STRATA_BATCH_YIELD_CHUNKS` chunks (default 8: a read below 8 chunks, 64K tokens
   at the default chunk, never gives way to anything). With `STRATA_BATCH_YIELD_CHUNKS=1` on the production split
   below (2x RTX PRO 4000 Blackwell, the NVFP4 arena, `"parallel": 4`, serial windows, `tools/piped_read_join_bench.py`'s
@@ -330,6 +339,16 @@ With the variables unset the read is one run as before. One log line per piece (
 ms (to Q of T)`, with `, then the slots decoded R rows in Y ms` when slots decode), per give-way (`the prompt read gives
 way at Q of T tokens; slot S holds it`) and per lead-in (`a read right after a read: the slots decoded R rows in Y ms
 first`).
+
+The pieces are also what bounds a read the concurrent mode above skips: **a prompt with pictures** is read the usual
+way, so without these variables it stops every decoding slot for the whole read, however long it is. With them it
+stops the slots for one piece at a time. Measured on the production split (2x RTX PRO 4000 Blackwell, the NVFP4
+arena, `"parallel": 8`, `PIECE=8192 DECODE_MAX_MS=400` beside `STRATA_PIPED_CONCURRENT=1`, which takes every
+text-only read: the two only meet for pictures), a 17K-token prompt with a picture beside two decoding streams:
+longest stop of a stream 15.2 s -> 6.5 s (one piece; the whole read was one run before), the streams' tokens in the
+join window 91 -> 120, and the joiner's own TTFT 15.7 -> 18.9 s (what the pieces and the decode budgets cost it).
+A text-only read decodes beside the slots unchanged with both variables set (a cold 72K join: longest stop 1.4-1.6 s,
+the joiner's TTFT 86.7 s, on both builds).
 
 **What it trades.** Every piece ends by draining the pipeline, so a long read takes longer - also on an idle server,
 since the pieces are what lets a short request in - and the decoding streams get tokens where they had none. It is a
