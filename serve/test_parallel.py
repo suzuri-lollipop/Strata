@@ -396,6 +396,14 @@ class ParallelService(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
 
+    def chatm(self, messages, max_tokens=64):
+        """One chat completion over these messages (a conversation's next turn renders its whole history)."""
+        body = {"messages": messages, "max_tokens": max_tokens, "reasoning_effort": "none"}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+
     def message(self, text, max_tokens=64):
         body = {"model": "m", "messages": [{"role": "user", "content": text}], "max_tokens": max_tokens}
         req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(),
@@ -672,6 +680,46 @@ class ParallelService(unittest.TestCase):
         res = self.race("long " * 600, "lung " * 600)
         self.assertEqual(sorted(r[0] for r in res.values()), ["ok, done."] * 2)
         self.assertFalse(any(x.startswith("YIELD ") for x in self.log.read_text().splitlines()))
+
+    def test_a_cached_next_turn_gives_way_even_when_long(self):
+        """The give-way asks what a waiting request reads, not what it renders: a conversation's next turn whose
+        history a free slot holds (its admission is a copy and the few new tokens) takes the control lines at the
+        next chunk of a long read even when its whole prompt is longer than half of it - by the rendered length it
+        waited out the whole read, a stopped generation beside a cold prompt."""
+        self.start(3)
+        convo = "conversation C first turn. " + "filler " * 340          # ~2,400 tokens once rendered
+        blocker = threading.Thread(target=lambda: self.chat("blocker LONGREPLY", max_tokens=200))
+        blocker.start()
+        time.sleep(0.05)
+        first = self.chat(convo)                                        # beside the blocker: it runs in a slot
+        reply = first["choices"][0]["message"]["content"]
+        self.assertEqual(reply, "ok, done.")
+        blocker.join(30)
+        deadline = time.time() + 10                     # a slot left at its stop token is freed at its BDONE
+        while not any(h for h in self.engine.slot_held if h) and time.time() < deadline:
+            time.sleep(0.02)
+        held = [h for h in self.engine.slot_held if h]
+        self.assertTrue(any(len(h) > 2000 for h in held), "turn 1's slot keeps the conversation")
+        out = {}
+
+        def go(k, fn):
+            t0 = time.time()
+            out[k] = (fn(), time.time() - t0)
+        long_q = "long " * 700                                          # 3,500 tokens: over twice the follow-up's
+        follow = [{"role": "user", "content": convo}, {"role": "assistant", "content": reply},
+                  {"role": "user", "content": "And the second turn's question?"}]
+        tl = threading.Thread(target=go, args=("long", lambda: self.chat(long_q, max_tokens=16)))
+        tl.start()
+        time.sleep(0.15)
+        tf = threading.Thread(target=go, args=("fu", lambda: self.chatm(follow, max_tokens=16)))
+        tf.start()
+        tl.join(30); tf.join(30)
+        self.assertEqual(out["long"][0]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(out["fu"][0]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertLess(out["fu"][1], out["long"][1] - 0.5, out)        # it did not wait out the long read
+        yields = [x for x in self.log.read_text().splitlines() if x.startswith("YIELD ")]
+        self.assertTrue(yields, "the long read gave way at a chunk boundary")
+        self.assertFalse(any(self.engine.slot_busy))
 
     def test_left_alone_it_goes_back_to_the_solo_path(self):
         """A request decoding in a slot whose neighbour finished goes back to the solo path (MTP drafts), continued

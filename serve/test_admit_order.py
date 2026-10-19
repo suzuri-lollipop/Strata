@@ -22,6 +22,9 @@ def engine_without_process(n=2):
     e = StrataEngine("missing-executable", [], lazy=True)
     e.batch = n
     e.slot_busy = [False] * n
+    e.slot_order, e.slot_used = list(range(n)), [0.0] * n
+    e.slot_held = [[] for _ in range(n)]        # no conversation caches: _cached_prefix finds nothing
+    e.slot_groups = 1
     e.slot_claims, e.slot_releasing, e._orphan_seen = set(), set(), {}
     e.slot_cv = threading.Condition()
     e.waiting, e.admitting, e.wait_lens, e.ctl_epoch = 0, 0, [], 0
@@ -48,7 +51,7 @@ class AdmitOrderTest(unittest.TestCase):
         self.cancels.append(c)
 
         def go():
-            gen = self.e._take_control(c, plen, **kw)
+            gen = self.e._take_control(c, [0] * plen, **kw)   # a prompt of plen tokens (nothing cached, or as told)
             try:
                 while True:
                     next(gen)
@@ -113,6 +116,27 @@ class AdmitOrderTest(unittest.TestCase):
             self.e.ctl.release()
             self.until(lambda: len(self.order) == 2, s=15.0)
         self.assertEqual(sorted(self.order), ["chat", "continuation"])
+
+    def test_a_cached_follow_up_counts_by_what_it_reads(self):
+        """A conversation's next turn renders a long prompt but reads only the new tokens (a slot's cache, or the
+        engine's own, serves the rest - the caller says how much): the order counts that, not the rendering."""
+        with mock.patch.object(server, "ADMIT_SHORT_FIRST", 8192), mock.patch.object(server, "ADMIT_MAX_WAIT_S", 60.0):
+            order = self.queue(("agent", 120000), ("followup", 100000, ), ("chat", 500))
+        self.assertEqual(order[0], "chat")
+        self.assertEqual(order[1:], ["agent", "followup"])              # the follow-up is long and reads it all
+
+    def test_a_slot_cached_follow_up_goes_before_the_agent_reads(self):
+        """The same request with 99,900 of its 100,000 tokens held by a free slot: it reads 100 and goes first."""
+        self.e.slot_held[3] = [0] * 99900                              # (the entry's cached count is what counts)
+        with mock.patch.object(server, "ADMIT_SHORT_FIRST", 8192), mock.patch.object(server, "ADMIT_MAX_WAIT_S", 60.0):
+            self.assertTrue(self.e.ctl.acquire(timeout=1))
+            self.take("agent", 120000, new=True)
+            self.until(lambda: self.e.waiting == 1)
+            self.take("followup", 100000, new=True, cached=99900)
+            self.until(lambda: self.e.waiting == 2)
+            self.e.ctl.release()
+            self.until(lambda: len(self.order) == 2, s=15.0)
+        self.assertEqual(self.order, ["followup", "agent"])
 
 
 if __name__ == "__main__":
