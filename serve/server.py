@@ -2743,6 +2743,32 @@ def batch_tune_args(cfg: dict, args: list[str]) -> list[str]:
     return out
 
 
+def tune_cfg_from_cli(a, cfg: dict) -> None:
+    """The command line's tuning flags win over the config's same-named keys: --parallel over "parallel",
+    --batch-groups / --batch-mtp / --adapt-async / --adapt-every over "batch_groups" / "batch_mtp" / "adapt_async" /
+    "adapt_every" (BATCH_TUNE_ARGS), and --piped-concurrent / --yield-chunks over the engine's "env"
+    (STRATA_PIPED_CONCURRENT / STRATA_BATCH_YIELD_CHUNKS).  A flag that was not given leaves the config as it is;
+    the config's own "args" still win over everything (parallel_args, batch_tune_args).  Mutates `cfg`."""
+    if getattr(a, "parallel", None) is not None:
+        cfg["parallel"] = a.parallel
+    if getattr(a, "batch_groups", None) is not None:
+        g = str(a.batch_groups).strip()
+        cfg["batch_groups"] = int(g) if g.isdigit() else a.batch_groups
+    if getattr(a, "batch_mtp", None):
+        cfg["batch_mtp"] = True
+    if getattr(a, "adapt_async", None):
+        cfg["adapt_async"] = True
+    if getattr(a, "adapt_every", None) is not None:
+        cfg["adapt_every"] = a.adapt_every
+    env_add = {}
+    if getattr(a, "piped_concurrent", None):
+        env_add["STRATA_PIPED_CONCURRENT"] = "1"
+    if getattr(a, "yield_chunks", None) is not None:
+        env_add["STRATA_BATCH_YIELD_CHUNKS"] = str(a.yield_chunks)
+    if env_add:
+        cfg["env"] = {**(cfg.get("env") or {}), **env_add}
+
+
 def profile_shape(path: str) -> tuple[int, int] | None:
     """An expert profile's (layers, experts per layer), from its header (tools/make_profile.py's format), or None
     when the file is missing, is not one or is shorter than the pairs its header promises."""
@@ -6891,10 +6917,34 @@ def main() -> int:
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
+    ap.add_argument("--parallel", type=int, default=None, metavar="N",
+                    help="run up to N requests at once in the engine's batch slots (its --batch); more wait their turn "
+                         "(also \"parallel\" in the config; default: one at a time)")
+    ap.add_argument("--batch-groups", default=None, metavar="G",
+                    help="with a layer split and --parallel: the slots in G groups pipelined through the GPUs, or "
+                         "\"auto\"; 1 = one serial window over every slot, where the adaptive tier and --batch-mtp run "
+                         "(also \"batch_groups\" in the config; default: the engine's choice, pipelined on a split)")
+    ap.add_argument("--batch-mtp", action="store_true", default=None,
+                    help="each batch slot verifies one MTP proposal per window (needs the config's --mtp and serial "
+                         "windows; also \"batch_mtp\": true in the config)")
+    ap.add_argument("--adapt-async", action="store_true", default=None,
+                    help="the adaptive VRAM expert tier's rounds do not block the windows (needs the resident RAM mode "
+                         "or the expert arena; also \"adapt_async\": true in the config)")
+    ap.add_argument("--adapt-every", type=int, default=None, metavar="N",
+                    help="an adaptive-tier round every N windows (the engine's default: 4; also \"adapt_every\" in the "
+                         "config)")
+    ap.add_argument("--piped-concurrent", action="store_true", default=None,
+                    help="with pipelined batch groups: read a long prompt on a thread of its own while the slots keep "
+                         "decoding (sets STRATA_PIPED_CONCURRENT=1 for the engine; the joining prompt pays)")
+    ap.add_argument("--yield-chunks", type=int, default=None, metavar="N",
+                    help="a prompt read with nothing decoding takes pieces of N chunks, so a waiting shorter request "
+                         "can cut in at their boundaries (sets STRATA_BATCH_YIELD_CHUNKS; the engine's default: 8, "
+                         "1 = every chunk)")
     a = ap.parse_args()
     cfg = read_config(a.config) if a.config else {}
     split_joined_args(cfg)
     lift_reasoning_effort_arg(cfg)
+    tune_cfg_from_cli(a, cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
     if a.gpu is not None:

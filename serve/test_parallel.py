@@ -16,7 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, StrataEngine, batch_tune_args, engine_args, parallel_args, serve
+from serve.server import (ByteTokenizer, Service, StrataEngine, batch_tune_args, engine_args, parallel_args, serve,
+                          tune_cfg_from_cli)
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -248,6 +249,31 @@ class ParallelArgs(unittest.TestCase):
         # and they reach the engine's command through engine_args
         args = engine_args({"args": ["--pack", "p"], "parallel": 2, "batch_groups": 1, "adapt_async": True})
         self.assertEqual(args, ["--pack", "p", "--batch", "2", "--batch-groups", "1", "--adapt-async", "1"])
+
+    def test_cli_tuning_flags_win_over_the_config(self):
+        import argparse
+        def ns(**kw):
+            base = dict(parallel=None, batch_groups=None, batch_mtp=None, adapt_async=None,
+                        adapt_every=None, piped_concurrent=None, yield_chunks=None)
+            base.update(kw)
+            return argparse.Namespace(**base)
+        cfg = {"parallel": 4, "batch_groups": 2, "env": {"X": "1"}}
+        tune_cfg_from_cli(ns(), cfg)                     # nothing given: the config is untouched
+        self.assertEqual((cfg["parallel"], cfg["batch_groups"], cfg["env"]), (4, 2, {"X": "1"}))
+        tune_cfg_from_cli(ns(parallel=8, batch_groups="auto"), cfg)
+        self.assertEqual((cfg["parallel"], cfg["batch_groups"]), (8, "auto"))
+        tune_cfg_from_cli(ns(batch_groups="1"), cfg)     # a number as a string arrives as a number
+        self.assertEqual(cfg["batch_groups"], 1)
+        tune_cfg_from_cli(ns(batch_mtp=True, adapt_async=True, adapt_every=2), cfg)
+        self.assertEqual((cfg["batch_mtp"], cfg["adapt_async"], cfg["adapt_every"]), (True, True, 2))
+        tune_cfg_from_cli(ns(batch_mtp=False), cfg)      # an unset flag does not turn a config key off
+        self.assertTrue(cfg["batch_mtp"])
+        tune_cfg_from_cli(ns(piped_concurrent=True, yield_chunks=1), cfg)
+        self.assertEqual(cfg["env"], {"X": "1", "STRATA_PIPED_CONCURRENT": "1",
+                                      "STRATA_BATCH_YIELD_CHUNKS": "1"})
+        # the flags' config keys reach the engine's command
+        args = engine_args({"args": ["--pack", "p"], "parallel": 8})
+        self.assertEqual(args[-2:], ["--batch", "8"])
 
 
 class PickSlot(unittest.TestCase):
